@@ -18,7 +18,7 @@ jobs:
       - name: Mirror Releases and Assets
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          UPSTREAM_REPO: storytold/photocraft
+          UPSTREAM_REPO: storytold/craft-launcher
         run: |
           # 1. Fetch upstream releases (oldest to newest)
           UPSTREAM_RELEASES=$(gh api "repos/${UPSTREAM_REPO}/releases" | jq 'reverse')
