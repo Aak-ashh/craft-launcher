@@ -1,10 +1,14 @@
 //! Drives the launcher UI against a fake backend: what's shown for each status, and which
-//! commands the buttons send. `ARTCRAFT_LAUNCHER_SNAPSHOTS=<dir>` also saves screenshots.
+//! commands the buttons send. `ARTCRAFT_LAUNCHER_SNAPSHOTS=<dir>` also saves screenshots; run that
+//! with `-- --test-threads=1`, as rendering on several threads at once can crash Vulkan loaders
+//! older than 1.4.350 (KhronosGroup/Vulkan-Loader#1863).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use artcraft_launcher_core::protocol::{Backend, Capabilities, Command, Event, JobPhase, LatestRelease, Origin, PausedDownload, Source};
+use artcraft_launcher_core::protocol::{
+    Backend, CANCELLED, Capabilities, Command, Event, INSTALL_CANCELLED, JobPhase, LatestRelease, Origin, PausedDownload, Source,
+};
 use artcraft_launcher_core::release::{Asset, Release};
 use artcraft_launcher_core::status::InstallSource;
 use artcraft_launcher_core::{Arch, Installed, Os, Platform, SUITE, version};
@@ -99,16 +103,36 @@ fn events() -> Vec<Event> {
     ev.push(Event::Progress { app: "filmcraft".into(), phase: JobPhase::Downloading { done: 48 << 20, total: 131 << 20 } });
     ev.push(Event::Paused { app: "deckcraft".into(), download: Some(PausedDownload { done: 30 << 20, total: 120 << 20 }) });
     ev.push(Event::Progress { app: "gridcraft".into(), phase: JobPhase::Reconnecting { done: 10 << 20, total: 90 << 20 } });
+    ev.push(Event::ReadyToInstall { app: "cadcraft".into(), ready: true });
     ev.push(Event::CheckFinished { at: NOW - 180, source: Source::GitHubApi, rate_limited_until: None });
     ev
 }
 
 fn harness(view: ViewMode, theme: egui::Theme, manage: bool) -> (Harness<'static, Option<LauncherUi>>, Rc<RefCell<Vec<Command>>>) {
+    harness_at(view, theme, manage, 1.0)
+}
+
+fn harness_at(view: ViewMode, theme: egui::Theme, manage: bool, scale: f32) -> (Harness<'static, Option<LauncherUi>>, Rc<RefCell<Vec<Command>>>) {
+    harness_with(events(), view, theme, manage, scale)
+}
+
+fn harness_with(
+    events: Vec<Event>,
+    view: ViewMode,
+    theme: egui::Theme,
+    manage: bool,
+    scale: f32,
+) -> (Harness<'static, Option<LauncherUi>>, Rc<RefCell<Vec<Command>>>) {
+    // Integration tests compile without cfg!(test), so system_lang() picks up the
+    // developer's locale. Force English so labels match the assertions.
+    artcraft_launcher_ui_egui::i18n::set_test_lang(artcraft_launcher_ui_egui::i18n::Lang::EN);
     let sent = Rc::new(RefCell::new(Vec::new()));
     let sent2 = sent.clone();
-    let mut backend = Some(Fake { events: events(), sent: sent2, manage, clock: Rc::new(Cell::new(NOW)) });
+    let mut backend = Some(Fake { events, sent: sent2, manage, clock: Rc::new(Cell::new(NOW)) });
     let settings = Settings { view, notify: false, ..Settings::default() };
-    let harness = Harness::builder().with_size(egui::vec2(1180.0, 900.0)).with_theme(theme).wgpu().build_ui_state(
+    // No `.wgpu()`: it gives every test its own GPU device, and those segfault on parallel test threads (see above).
+    // The default renderer creates one only when a test renders.
+    let harness = Harness::builder().with_size(egui::vec2(1180.0, 900.0)).with_pixels_per_point(scale).with_theme(theme).build_ui_state(
         move |ui, state: &mut Option<LauncherUi>| {
             if state.is_none()
                 && let Some(b) = backend.take()
@@ -135,6 +159,35 @@ fn snapshot(h: &mut Harness<'_, Option<LauncherUi>>, name: &str) {
     let Some(dir) = std::env::var_os("ARTCRAFT_LAUNCHER_SNAPSHOTS") else { return };
     let img = h.render().unwrap();
     img.save(std::path::Path::new(&dir).join(format!("{name}.png"))).unwrap();
+}
+
+#[test]
+fn keeps_working_with_no_window_then_draws_in_a_new_one() {
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let backend = Fake { events: events(), sent: sent.clone(), manage: true, clock: Rc::new(Cell::new(NOW)) };
+    let windowless = egui::Context::default();
+    let mut ui = LauncherUi::new(&windowless, Box::new(backend), Settings { notify: false, ..Settings::default() });
+    // No window: the backend's news is still taken in.
+    ui.logic(&windowless, &mut NoHost);
+    assert!(sent.borrow().contains(&Command::CheckForUpdates { force: false }));
+    assert_eq!(ui.update_count(), 2);
+    assert_eq!(ui.settings.last_check, Some(NOW - 180));
+
+    let mut attached = false;
+    let mut h = Harness::builder().with_size(egui::vec2(1180.0, 900.0)).build_ui_state(
+        move |egui_ui, state: &mut LauncherUi| {
+            if !attached {
+                attached = true;
+                state.attach(egui_ui.ctx());
+            }
+            state.logic(&egui_ui.ctx().clone(), &mut NoHost);
+            state.ui(egui_ui, &mut NoHost);
+        },
+        ui,
+    );
+    h.run_steps(4);
+    h.get_by_label("Update to 0.5.0");
+    h.get_by_label("Update to 0.6.0");
 }
 
 #[test]
@@ -186,6 +239,130 @@ fn downloads_can_be_paused_resumed_and_discarded() {
 }
 
 #[test]
+fn a_kept_download_offers_retry_install_and_download_again() {
+    let (mut h, sent) = harness(ViewMode::Grid, egui::Theme::Dark, true);
+    h.run_steps(4);
+    if let Some(l) = h.state_mut().as_mut() {
+        l.settings.filter = artcraft_launcher_ui_egui::settings::Filter::NotInstalled;
+    }
+    h.run_steps(6);
+    // Below the fold in the restyled grid: bring the card on screen first.
+    h.get_by_label("Retry install").scroll_to_me();
+    h.run_steps(4);
+    snapshot(&mut h, "grid-retry-install-dark");
+    sent.borrow_mut().clear();
+    let retry = h.get_by_label("Retry install");
+    let row = retry.rect();
+    retry.click();
+    h.run_steps(2);
+    assert_eq!(*sent.borrow(), [Command::Install { app: "cadcraft".into() }]);
+    sent.borrow_mut().clear();
+    // The … menu beside it.
+    let beside = |r: egui::Rect| row.y_range().contains(r.center().y) && (row.right()..row.right() + 60.0).contains(&r.left());
+    h.get_all_by_label("…").find(|n| beside(n.rect())).unwrap().click();
+    h.run_steps(3);
+    snapshot(&mut h, "grid-retry-install-menu-dark");
+    h.get_by_label("Download again").click();
+    h.run_steps(2);
+    assert_eq!(*sent.borrow(), [Command::Cancel { app: "cadcraft".into() }, Command::Install { app: "cadcraft".into() }]);
+    // Apps without a kept download don't offer it.
+    assert_eq!(h.query_all_by_label("Retry install").count(), 1);
+}
+
+#[test]
+fn a_dismissed_install_prompt_is_not_called_a_cancelled_download() {
+    let finished = |app: &str, why: &str| Event::JobFinished { app: app.into(), result: Err(why.into()) };
+    // The password prompt was dismissed with the download kept (cadcraft) and without (pdfcraft);
+    // a download was cancelled (vectorcraft).
+    let mut ev = events();
+    ev.push(finished("cadcraft", INSTALL_CANCELLED));
+    ev.push(finished("pdfcraft", INSTALL_CANCELLED));
+    ev.push(finished("vectorcraft", CANCELLED));
+    let (mut h, _) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, true, 1.0);
+    h.run_steps(6);
+    snapshot(&mut h, "grid-install-cancelled-dark");
+    for toast in ["Install cancelled. The download is kept for the next try.", "Install cancelled", "Download cancelled"] {
+        assert_eq!(h.query_all_by_label(toast).count(), 1, "{toast}");
+    }
+}
+
+#[test]
+fn a_kept_update_names_its_version_and_an_up_to_date_app_is_not_downloaded_again() {
+    let mut ev = events();
+    for app in ["effectcraft", "wordcraft"] {
+        ev.push(Event::ReadyToInstall { app: app.into(), ready: true });
+    }
+    let (mut h, sent) = harness_with(ev, ViewMode::Table, egui::Theme::Dark, true, 1.0);
+    h.run_steps(8);
+    snapshot(&mut h, "table-retry-update-dark");
+    sent.borrow_mut().clear();
+    assert!(h.query_by_label("Update to 0.6.0").is_none());
+    h.get_by_label("Retry update to 0.6.0").click();
+    h.run_steps(2);
+    assert_eq!(*sent.borrow(), [Command::Install { app: "effectcraft".into() }]);
+    // WordCraft is up to date: its menu offers Reinstall, which uses the kept file.
+    let row = h.get_all_by_label("WordCraft").next().unwrap().rect().center().y;
+    h.get_all_by_label("…").find(|n| (n.rect().center().y - row).abs() < 25.0).unwrap().click();
+    h.run_steps(3);
+    h.get_by_label("Reinstall");
+    assert!(h.query_by_label("Download again").is_none());
+}
+
+#[test]
+fn an_install_waiting_for_another_says_so_and_can_be_cancelled() {
+    let mut events = events();
+    // Two updates reached the system's installer together: one runs, the other waits its turn.
+    events.push(Event::Progress { app: "photocraft".into(), phase: JobPhase::Installing });
+    events.push(Event::Progress { app: "effectcraft".into(), phase: JobPhase::Waiting });
+    let (mut h, sent) = harness_with(events, ViewMode::Grid, egui::Theme::Dark, true, 1.0);
+    h.run_steps(6);
+    snapshot(&mut h, "grid-waiting-dark");
+    h.get_by_label("Installing…");
+    h.get_by_label("Waiting for another app…");
+    // Only the waiting one: the install that is running can't be called off.
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    let cancels: Vec<_> = sent.borrow().iter().filter(|c| matches!(c, Command::Cancel { .. })).cloned().collect();
+    assert_eq!(cancels, [Command::Cancel { app: "effectcraft".into() }]);
+}
+
+#[test]
+fn the_launcher_update_waiting_for_other_installs_can_be_cancelled() {
+    let mut ev = events();
+    ev.push(Event::LauncherUpdate(release("artcraft-launcher", "0.2.0", NOW)));
+    ev.push(Event::Progress { app: "artcraft-launcher".into(), phase: JobPhase::Waiting });
+    let (mut h, sent) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, true, 1.0);
+    h.run_steps(6);
+    snapshot(&mut h, "grid-launcher-waiting-dark");
+    h.get_by_label("Waiting for other installs…");
+    sent.borrow_mut().clear();
+    h.get_by_label("Cancel update").click();
+    h.run_steps(2);
+    assert_eq!(*sent.borrow(), [Command::Cancel { app: "artcraft-launcher".into() }]);
+}
+
+#[test]
+fn each_cancellation_says_what_it_called_off() {
+    let finished = |app: &str, why: &str| Event::JobFinished { app: app.into(), result: Err(why.into()) };
+    let mut ev = events();
+    // An uninstall called off while it waited for the installer.
+    ev.push(Event::Progress { app: "lightcraft".into(), phase: JobPhase::Removing });
+    ev.push(Event::Progress { app: "lightcraft".into(), phase: JobPhase::Waiting });
+    ev.push(finished("lightcraft", CANCELLED));
+    // The launcher's own update, cancelled while it waited.
+    ev.push(Event::LauncherUpdate(release("artcraft-launcher", "0.2.0", NOW)));
+    ev.push(Event::Progress { app: "artcraft-launcher".into(), phase: JobPhase::Waiting });
+    ev.push(finished("artcraft-launcher", CANCELLED));
+    // A download cancelled mid-way.
+    ev.push(finished("filmcraft", CANCELLED));
+    let (mut h, _) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, true, 1.0);
+    h.run_steps(6);
+    for toast in ["Uninstall cancelled", "Update cancelled", "Download cancelled"] {
+        assert_eq!(h.query_all_by_label(toast).count(), 1, "{toast}");
+    }
+}
+
+#[test]
 fn table_view_and_light_theme() {
     let (mut h, sent) = harness(ViewMode::Table, egui::Theme::Light, true);
     h.run_steps(8);
@@ -213,6 +390,35 @@ fn switching_views_and_filters() {
     snapshot(&mut h, "table-updates-dark");
     assert!(h.query_by_label("WordCraft").is_none());
     h.get_by_label("PhotoCraft");
+}
+
+/// How far the middle of these lines of text is below the middle of the app icon beside them, in points.
+fn below_icon_centre(h: &Harness<'_, Option<LauncherUi>>, lines: &[&str]) -> f32 {
+    let text = lines.iter().map(|l| h.get_by_label(l).rect()).reduce(|a, b| a.union(b)).unwrap();
+    let icon = h
+        .query_all(egui_kittest::kittest::by().role(egui::accesskit::Role::Image))
+        .map(|n| n.rect())
+        .filter(|r| r.right() <= text.left() && r.top() < text.bottom() && r.bottom() > text.top())
+        .max_by(|a, b| a.right().total_cmp(&b.right()))
+        .unwrap();
+    assert!(text.left() - icon.right() < 24.0, "no icon beside {lines:?}");
+    text.center().y - icon.center().y
+}
+
+#[test]
+fn name_and_tagline_are_centred_on_the_icon() {
+    for (scale, suffix) in [(1.0, "-1x"), (1.5, "-1.5x"), (2.0, "-2x")] {
+        let (mut h, _) = harness_at(ViewMode::Grid, egui::Theme::Dark, true, scale);
+        h.run_steps(8);
+        snapshot(&mut h, &format!("grid-dark{suffix}"));
+        let off = below_icon_centre(&h, &["PhotoCraft", "Image editing", "Like Adobe Photoshop®"]);
+        assert!(off.abs() < 0.25, "grid at {scale}x: {off}");
+        let (mut h, _) = harness_at(ViewMode::Table, egui::Theme::Light, true, scale);
+        h.run_steps(8);
+        snapshot(&mut h, &format!("table-light{suffix}"));
+        let off = below_icon_centre(&h, &["PhotoCraft", "Image editing"]);
+        assert!(off.abs() < 0.25, "table at {scale}x: {off}");
+    }
 }
 
 /// The app names in the order the table shows them.

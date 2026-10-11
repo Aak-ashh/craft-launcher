@@ -2,11 +2,14 @@
 
 use std::time::Duration;
 
-use artcraft_launcher_core::protocol::{Backend, BackendOptions, CANCELLED, Capabilities, Command, Event, LatestRelease, PAUSED, Source};
+use artcraft_launcher_core::protocol::{
+    Backend, BackendOptions, CANCELLED, Capabilities, Command, Event, INSTALL_CANCELLED, JobPhase, LatestRelease, PAUSED, Source,
+};
 use artcraft_launcher_core::release::Release;
 use artcraft_launcher_core::status::AppStatus;
 use artcraft_launcher_core::{Platform, SUITE};
 
+use crate::i18n::set_current;
 use crate::model::AppEntry;
 use crate::settings::{Filter, Settings, SortKey, ViewMode};
 use crate::theme::{self, Tokens};
@@ -92,11 +95,22 @@ pub struct LauncherUi {
     /// Fonts registered with `set_fonts` only exist from the next frame on; drawing with the named
     /// weights before then would abort.
     fonts_ready: bool,
+    /// Whether the installed fonts include the system's Chinese font. Added the first time Chinese
+    /// is the language in use, then kept for the session.
+    cjk_fonts: bool,
     sent_options: Option<BackendOptions>,
     /// Unix seconds of the last look at what's installed (startup counts).
     last_detect: i64,
     /// Whether the window had focus last frame, to re-check when the user comes back to it.
     was_focused: bool,
+}
+
+/// The language to draw in: the preference, or English where it needs a Chinese font the system
+/// doesn't have (Settings says so), rather than boxes for every character. The only place the
+/// Chinese font gets loaded: when Chinese is selected, or Auto resolves to it.
+pub(crate) fn effective_lang(pref: &str) -> crate::i18n::Lang {
+    let lang = crate::i18n::Lang::from_pref(pref);
+    if lang.needs_cjk_font() && !theme::cjk_font_available() { crate::i18n::Lang::EN } else { lang }
 }
 
 /// How often to look again at what's installed, to notice apps installed or removed outside
@@ -107,7 +121,8 @@ const RESCAN_ON_FOCUS_AFTER: i64 = 30;
 
 impl LauncherUi {
     pub fn new(ctx: &egui::Context, backend: Box<dyn Backend>, settings: Settings) -> Self {
-        theme::install_fonts(ctx);
+        let cjk_fonts = effective_lang(&settings.language).needs_cjk_font();
+        theme::install_fonts(ctx, cjk_fonts);
         egui_extras::install_image_loaders(ctx);
         let caps = backend.capabilities();
         let platform = backend.platform();
@@ -131,10 +146,21 @@ impl LauncherUi {
             started: false,
             applied_theme: None,
             fonts_ready: false,
+            cjk_fonts,
             sent_options: None,
             last_detect: 0,
             was_focused: true,
         }
+    }
+
+    /// Moves the UI to another window's context: fonts, image loaders and the theme belong to a
+    /// context, and toasts are timed on its clock.
+    pub fn attach(&mut self, ctx: &egui::Context) {
+        theme::install_fonts(ctx, self.cjk_fonts);
+        egui_extras::install_image_loaders(ctx);
+        self.fonts_ready = false;
+        self.applied_theme = None;
+        self.toasts.clear();
     }
 
     /// Installed apps with an update waiting (the tray shows the count).
@@ -171,6 +197,7 @@ impl LauncherUi {
 
     /// Non-drawing work: runs every frame and also while the window is hidden in the tray.
     pub fn logic(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
+        set_current(crate::i18n::Lang::from_pref(&self.settings.language));
         let options = BackendOptions { kinds: self.settings.preferred_kinds.clone(), prereleases: self.settings.prereleases };
         if self.sent_options.as_ref() != Some(&options) {
             self.backend.send(Command::Configure(options.clone()));
@@ -257,18 +284,35 @@ impl LauncherUi {
                 }
                 false
             }
-            Event::JobFinished { app, result } => {
-                if app == artcraft_launcher_core::catalog::LAUNCHER_ID {
-                    self.launcher_job = None;
+            Event::ReadyToInstall { app, ready } => {
+                if let Some(e) = self.entry_mut(&app) {
+                    e.ready = ready;
                 }
+                false
+            }
+            Event::JobFinished { app, result } => {
+                let launcher = app == artcraft_launcher_core::catalog::LAUNCHER_ID;
+                // What the job was doing when it ended says what a cancellation called off.
+                let last = if launcher { self.launcher_job.take() } else { self.entry(&app).and_then(|e| e.job) };
                 if let Some(e) = self.entry_mut(&app) {
                     e.job = None;
                 }
+                let kept = self.entry(&app).is_some_and(|e| e.ready);
                 match result {
                     Ok(msg) => self.toast(ctx, msg, false),
                     // The paused card says it all.
                     Err(e) if e == PAUSED => {}
-                    Err(e) if e == CANCELLED => self.toast(ctx, "Download cancelled", false),
+                    Err(e) if e == CANCELLED && launcher => self.toast(ctx, tl!("Update cancelled"), false),
+                    // An install's own cancellations end as INSTALL_CANCELLED, so past the
+                    // download this is a removal called off while it waited for the installer.
+                    Err(e) if e == CANCELLED && matches!(last, Some(JobPhase::Waiting | JobPhase::Removing)) => {
+                        self.toast(ctx, tl!("Uninstall cancelled"), false);
+                    }
+                    Err(e) if e == CANCELLED => self.toast(ctx, tl!("Download cancelled"), false),
+                    Err(e) if e == INSTALL_CANCELLED && kept => {
+                        self.toast(ctx, tl!("Install cancelled. The download is kept for the next try."), false);
+                    }
+                    Err(e) if e == INSTALL_CANCELLED => self.toast(ctx, tl!("Install cancelled"), false),
                     Err(e) => self.toast(ctx, e, true),
                 }
                 true
@@ -308,9 +352,13 @@ impl LauncherUi {
         }
         if self.settings.notify {
             let (title, body) = match fresh.as_slice() {
-                [(_, name, v)] => (format!("{name} {v} is available"), "Open ArtCraft Launcher to update.".to_string()),
+                [(_, name, v)] => {
+                    let body: String = tl!("Open ArtCraft Launcher to update.").to_string();
+                    (crate::i18n::fmt(tl!("{name} {v} is available"), &[("name", name), ("v", v)]), body)
+                }
                 many => {
-                    (format!("{} updates are available", many.len()), many.iter().map(|(_, n, v)| format!("{n} {v}")).collect::<Vec<_>>().join(", "))
+                    let body: String = many.iter().map(|(_, n, v)| format!("{n} {v}")).collect::<Vec<_>>().join(", ");
+                    (crate::i18n::fmt(tl!("{count} updates are available"), &[("count", &many.len().to_string())]), body)
                 }
             };
             host.notify(&title, &body);
@@ -323,6 +371,15 @@ impl LauncherUi {
     /// Draws the launcher.
     pub fn ui(&mut self, ui: &mut egui::Ui, host: &mut dyn Host) {
         let ctx = ui.ctx().clone();
+        // Set the current language for this frame based on settings.
+        let lang = effective_lang(&self.settings.language);
+        set_current(lang);
+        // `effective_lang` only picks Chinese once its font has loaded.
+        if lang.needs_cjk_font() && !self.cjk_fonts {
+            theme::install_fonts(&ctx, true);
+            self.cjk_fonts = true;
+            self.fonts_ready = false;
+        }
         if !self.fonts_ready {
             self.fonts_ready = true;
             ctx.request_repaint();
@@ -332,24 +389,24 @@ impl LauncherUi {
             theme::apply(&ctx, self.settings.theme);
             self.applied_theme = Some(self.settings.theme);
         }
-        let t = Tokens::get(&ctx);
+        let tokens = Tokens::get(&ctx);
         if self.entries.iter().any(|e| e.job.is_some()) || self.checking {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
         // The bars' separator lines are the hairlines under the header and over the footer.
         egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(t.bg))
+            .frame(egui::Frame::new().fill(tokens.bg))
             .exact_size(crate::views::HEADER_H)
             .resizable(false)
             .show(ui, |ui| self.header(ui, host.title_bar()));
         egui::Panel::bottom("footer")
-            .frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(20, 0)))
+            .frame(egui::Frame::new().fill(tokens.bg).inner_margin(egui::Margin::symmetric(20, 0)))
             .exact_size(crate::views::FOOTER_H)
             .resizable(false)
             .show(ui, |ui| self.footer(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 18, bottom: 0 }))
+            .frame(egui::Frame::new().fill(tokens.bg).inner_margin(egui::Margin { left: 20, right: 20, top: 18, bottom: 0 }))
             .show(ui, |ui| {
                 self.toolbar(ui);
                 ui.add_space(18.0);
@@ -363,7 +420,7 @@ impl LauncherUi {
                     if ids.is_empty() {
                         ui.add_space(40.0);
                         ui.vertical_centered(|ui| {
-                            crate::widgets::hud(ui, "No apps match", t.muted);
+                            crate::widgets::hud(ui, tl!("No apps match"), tokens.muted);
                         });
                     } else {
                         match self.settings.view {
@@ -460,7 +517,7 @@ impl LauncherUi {
             }
         }
         match (api, github) {
-            (true, true) => Some(format!("{} and {}", Origin::ArtCraftApi.label(), Origin::GitHub.label())),
+            (true, true) => Some(crate::i18n::fmt(tl!("{a} and {b}"), &[("a", Origin::ArtCraftApi.label()), ("b", Origin::GitHub.label())])),
             (true, false) => Some(Origin::ArtCraftApi.label().to_string()),
             (false, true) => Some(Origin::GitHub.label().to_string()),
             (false, false) => None,
@@ -505,7 +562,7 @@ impl LauncherUi {
                         ui.horizontal(|ui| {
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
                             ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, accent);
-                            ui.add(egui::Label::new(egui::RichText::new(&toast.text).color(t.ink)).wrap());
+                            ui.add(egui::Label::new(egui::RichText::new(crate::i18n::msg(&toast.text)).color(t.ink)).wrap());
                         });
                     });
                 if r.response.interact(egui::Sense::click()).clicked() {
